@@ -1,731 +1,702 @@
-#include "cc1101.h"
-#include "cc1101pa.h"
-#include "esphome/core/helpers.h"
+/*
+  https://github.com/gabest11/esphome-cc1101
+
+  This is a CC1101 transceiver component that works with esphome's remote_transmitter/remote_receiver.
+  
+  It can be compiled with Arduino and esp-idf framework and should support any esphome compatible board through the SPI Bus.
+
+  On ESP8266, you can use the same pin for GDO and GD2 (it is an optional parameter).
+
+  The source code is a mashup of the following github projects with some special esphome sauce:
+
+  https://github.com/dbuezas/esphome-cc1101 (the original esphome component)
+  https://github.com/nistvan86/esphome-q7rf (how to use esphome with spi)
+  https://github.com/LSatan/SmartRC-CC1101-Driver-Lib (cc1101 setup code)
+
+  TODO: RP2040? (USE_RP2040)
+  TODO: Libretiny? (USE_LIBRETINY)
+*/
+
 #include "esphome/core/log.h"
-#include <cmath>
+#include "cc1101.h"
+#include "cc1101defs.h"
+#include <limits.h>
 
-namespace esphome::cc1101 {
+#ifdef USE_ARDUINO
+#include <Arduino.h>
+#else // USE_ESP_IDF
+#include <driver/gpio.h>
+long map(long x, long in_min, long in_max, long out_min, long out_max) { return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min; }
+#endif
 
-static const char *const TAG = "cc1101";
+namespace esphome {
+namespace cc1101 {
 
-static void split_float(float value, int mbits, uint8_t &e, uint32_t &m) {
-  int e_tmp;
-  float m_tmp = std::frexp(value, &e_tmp);
-  if (e_tmp <= mbits) {
-    e = 0;
-    m = 0;
-    return;
-  }
-  e = static_cast<uint8_t>(e_tmp - mbits - 1);
-  m = static_cast<uint32_t>(((m_tmp * 2 - 1) * (1 << (mbits + 1))) + 1) >> 1;
-  if (m == (1UL << mbits)) {
-    e = e + 1;
-    m = 0;
-  }
+static const char *TAG = "cc1101";
+
+uint8_t PA_TABLE[8]     {0x00,0xC0,0x00,0x00,0x00,0x00,0x00,0x00};
+//                       -30  -20  -15  -10   0    5    7    10
+uint8_t PA_TABLE_315[8] {0x12,0x0D,0x1C,0x34,0x51,0x85,0xCB,0xC2};             // 300 - 348
+uint8_t PA_TABLE_433[8] {0x12,0x0E,0x1D,0x34,0x60,0x84,0xC8,0xC0};             // 387 - 464
+//                        -30  -20  -15  -10  -6    0    5    7    10   12
+uint8_t PA_TABLE_868[10] {0x03,0x17,0x1D,0x26,0x37,0x50,0x86,0xCD,0xC5,0xC0};  // 779 - 899.99
+//                        -30  -20  -15  -10  -6    0    5    7    10   11
+uint8_t PA_TABLE_915[10] {0x03,0x0E,0x1E,0x27,0x38,0x8E,0x84,0xCC,0xC3,0xC0};  // 900 - 928
+
+CC1101::CC1101()
+{
+  this->gdo0_ = NULL;
+  this->gdo2_ = NULL;
+  this->bandwidth_ = 200;
+  this->frequency_ = 433920;
+  this->rssi_sensor_ = NULL;
+  this->lqi_sensor_ = NULL;
+
+  this->partnum_ = 0;
+  this->version_ = 0;
+  this->last_rssi_ = INT_MIN;
+  this->last_lqi_ = INT_MIN;
+
+  this->mode_ = false;
+  this->modulation_ = 2;
+  this->chan_ = 0;
+  this->pa_ = 12;
+  this->last_pa_ = -1;
+  this->m4RxBw_ = 0;
+  this->trxstate_ = 0;
+
+  this->clb_[0][0] = 24; 
+  this->clb_[0][1] = 28;
+  this->clb_[1][0] = 31; 
+  this->clb_[1][1] = 38;
+  this->clb_[2][0] = 65; 
+  this->clb_[2][1] = 76;
+  this->clb_[3][0] = 77; 
+  this->clb_[3][1] = 79;
 }
 
-CC1101Component::CC1101Component() {
-  // Datasheet defaults
-  memset(&this->state_, 0, sizeof(this->state_));
-  this->state_.GDO2_CFG = 0x0D;  // Serial Data (for RX on GDO2)
-  this->state_.GDO1_CFG = 0x2E;
-  this->state_.GDO0_CFG = 0x0D;  // Serial Data (for RX on GDO0 / TX Input)
-  this->state_.FIFO_THR = 7;
-  this->state_.SYNC1 = 0xD3;
-  this->state_.SYNC0 = 0x91;
-  this->state_.PKTLEN = 0xFF;
-  this->state_.APPEND_STATUS = 1;
-  this->state_.LENGTH_CONFIG = 1;
-  this->state_.CRC_EN = 1;
-  this->state_.WHITE_DATA = 1;
-  this->state_.FREQ_IF = 0x0F;
-  this->state_.FREQ2 = 0x1E;
-  this->state_.FREQ1 = 0xC4;
-  this->state_.FREQ0 = 0xEC;
-  this->state_.DRATE_E = 0x0C;
-  this->state_.CHANBW_E = 0x02;
-  this->state_.DRATE_M = 0x22;
-  this->state_.SYNC_MODE = 2;
-  this->state_.CHANSPC_E = 2;
-  this->state_.NUM_PREAMBLE = 2;
-  this->state_.CHANSPC_M = 0xF8;
-  this->state_.DEVIATION_M = 7;
-  this->state_.DEVIATION_E = 4;
-  this->state_.RX_TIME = 7;
-  this->state_.CCA_MODE = 3;
-  this->state_.PO_TIMEOUT = 1;
-  this->state_.FOC_LIMIT = 2;
-  this->state_.FOC_POST_K = 1;
-  this->state_.FOC_PRE_K = 2;
-  this->state_.FOC_BS_CS_GATE = 1;
-  this->state_.BS_POST_KP = 1;
-  this->state_.BS_POST_KI = 1;
-  this->state_.BS_PRE_KP = 2;
-  this->state_.BS_PRE_KI = 1;
-  this->state_.MAGN_TARGET = 3;
-  this->state_.AGC_LNA_PRIORITY = 1;
-  this->state_.FILTER_LENGTH = 1;
-  this->state_.WAIT_TIME = 1;
-  this->state_.HYST_LEVEL = 2;
-  this->state_.WOREVT1 = 0x87;
-  this->state_.WOREVT0 = 0x6B;
-  this->state_.RC_CAL = 1;
-  this->state_.EVENT1 = 7;
-  this->state_.RC_PD = 1;
-  this->state_.MIX_CURRENT = 2;
-  this->state_.LODIV_BUF_CURRENT_RX = 1;
-  this->state_.LNA2MIX_CURRENT = 1;
-  this->state_.LNA_CURRENT = 1;
-  this->state_.LODIV_BUF_CURRENT_TX = 1;
-  this->state_.FSCAL3_LO = 9;
-  this->state_.CHP_CURR_CAL_EN = 2;
-  this->state_.FSCAL3_HI = 2;
-  this->state_.FSCAL2 = 0x0A;
-  this->state_.FSCAL1 = 0x20;
-  this->state_.FSCAL0 = 0x0D;
-  this->state_.RCCTRL1 = 0x41;
-  this->state_.FSTEST = 0x59;
-  this->state_.PTEST = 0x7F;
-  this->state_.AGCTEST = 0x3F;
-  this->state_.TEST2 = 0x88;
-  this->state_.TEST1 = 0x31;
-  this->state_.TEST0_LO = 1;
-  this->state_.VCO_SEL_CAL_EN = 1;
-  this->state_.TEST0_HI = 2;
-
-  // PKTCTRL0
-  this->state_.PKT_FORMAT = 3;
-  this->state_.LENGTH_CONFIG = 2;
-  this->state_.FS_AUTOCAL = 1;
-
-  // CRITICAL: Initialize PA Table to avoid transmitting 0 power (Silence)
-  memset(this->pa_table_, 0, sizeof(this->pa_table_));
+void CC1101::set_config_gdo0(InternalGPIOPin* pin)
+{
+  gdo0_ = pin; 
+  
+  if(gdo2_ == NULL) gdo2_ = pin;
 }
 
-void IRAM_ATTR CC1101Component::gpio_intr(CC1101Component *arg) { arg->enable_loop_soon_any_context(); }
+void CC1101::set_config_gdo2(InternalGPIOPin* pin)
+{
+  gdo2_ = pin;
+}
 
-void CC1101Component::setup() {
+void CC1101::set_config_bandwidth(uint32_t bandwidth)
+{
+  bandwidth_ = bandwidth;
+}
+
+void CC1101::set_config_frequency(uint32_t frequency)
+{
+  frequency_ = frequency;
+}
+
+void CC1101::set_config_rssi_sensor(sensor::Sensor* rssi_sensor)
+{
+  rssi_sensor_ = rssi_sensor;
+}
+
+void CC1101::set_config_lqi_sensor(sensor::Sensor* lqi_sensor)
+{
+  lqi_sensor_ = lqi_sensor;
+}
+
+void CC1101::setup()
+{
+  this->gdo0_->setup();
+  this->gdo2_->setup();
+  this->gdo0_->pin_mode(gpio::FLAG_OUTPUT);
+  this->gdo2_->pin_mode(gpio::FLAG_INPUT);
+
   this->spi_setup();
 
-  if (this->gdo0_pin_ != nullptr) {
-    this->gdo0_pin_->setup();
-  }
-
-  this->configure();
-  if (this->is_failed()) {
+  if(!this->reset())
+  {
+    mark_failed();
+    ESP_LOGE(TAG, "Failed to reset CC1101 modem. Check connection.");
     return;
   }
 
-  // Defer pin mode setup until after all components have completed setup()
-  // This handles the case where remote_transmitter runs after CC1101 and changes pin mode
-  if (this->gdo0_pin_ != nullptr) {
-    this->defer([this]() {
-      this->gdo0_pin_->pin_mode(gpio::FLAG_INPUT);
-      if (this->state_.PKT_FORMAT == static_cast<uint8_t>(PacketFormat::PACKET_FORMAT_FIFO)) {
-        this->gdo0_pin_->attach_interrupt(&CC1101Component::gpio_intr, this, gpio::INTERRUPT_RISING_EDGE);
-      }
-    });
+  // ELECHOUSE_cc1101.Init();
+
+  this->write_register(CC1101_FSCTRL1, 0x06);
+
+  this->set_mode(false);
+  this->set_frequency(this->frequency_);
+
+  this->write_register(CC1101_MDMCFG1, 0x02);
+  this->write_register(CC1101_MDMCFG0, 0xF8);
+  this->write_register(CC1101_CHANNR, this->chan_);
+  this->write_register(CC1101_DEVIATN, 0x47);
+  this->write_register(CC1101_FREND1, 0x56);
+  this->write_register(CC1101_MCSM0, 0x18);
+  this->write_register(CC1101_FOCCFG, 0x16);
+  this->write_register(CC1101_BSCFG, 0x1C);
+  this->write_register(CC1101_AGCCTRL2, 0xC7);
+  this->write_register(CC1101_AGCCTRL1, 0x00);
+  this->write_register(CC1101_AGCCTRL0, 0xB2);
+  this->write_register(CC1101_FSCAL3, 0xE9);
+  this->write_register(CC1101_FSCAL2, 0x2A);
+  this->write_register(CC1101_FSCAL1, 0x00);
+  this->write_register(CC1101_FSCAL0, 0x1F);
+  this->write_register(CC1101_FSTEST, 0x59);
+  this->write_register(CC1101_TEST2, 0x81);
+  this->write_register(CC1101_TEST1, 0x35);
+  this->write_register(CC1101_TEST0, 0x09);
+  this->write_register(CC1101_PKTCTRL1, 0x04);
+  this->write_register(CC1101_ADDR, 0x00);
+  this->write_register(CC1101_PKTLEN, 0x00);
+
+  // ELECHOUSE_cc1101.setRxBW(_bandwidth);
+
+  this->set_rxbw(this->bandwidth_);
+
+  // ELECHOUSE_cc1101.setMHZ(_freq);
+
+  this->set_frequency(this->frequency_); // TODO: already set
+
+  //
+
+  this->set_rx();
+
+  //
+
+  ESP_LOGI(TAG, "CC1101 initialized.");
+}
+
+void CC1101::update()
+{
+  if(this->rssi_sensor_ != NULL)
+  {
+    int32_t rssi = this->get_rssi();
+
+    if(rssi != this->last_rssi_)
+    {
+      this->rssi_sensor_->publish_state(rssi);
+
+      this->last_rssi_ = rssi;
+    }
+  }
+
+  if(this->lqi_sensor_ != NULL)
+  {
+    int32_t lqi = this->get_lqi() & 0x7f; // msb = CRC ok or not set
+
+    if(lqi != this->last_lqi_)
+    {
+      this->lqi_sensor_->publish_state(lqi);
+
+      this->last_lqi_ = lqi;
+    }
   }
 }
 
-void CC1101Component::configure() {
-  // Manual reset sequence per CC1101 datasheet section 19.1.2
-  this->cs_->digital_write(true);
-  delayMicroseconds(1);
+void CC1101::dump_config()
+{
+  ESP_LOGCONFIG(TAG, "CC1101 partnum %02x version %02x:", this->partnum_, this->version_);
+  LOG_PIN("  CC1101 CS Pin: ", this->cs_);
+  LOG_PIN("  CC1101 GDO0: ", this->gdo0_);
+  LOG_PIN("  CC1101 GDO2: ", this->gdo2_);
+  ESP_LOGCONFIG(TAG, "  CC1101 Bandwith: %d KHz", this->bandwidth_);
+  ESP_LOGCONFIG(TAG, "  CC1101 Frequency: %d KHz", this->frequency_);
+  LOG_SENSOR("  ", "RSSI", this->rssi_sensor_);
+  LOG_SENSOR("  ", "LQI", this->lqi_sensor_);
+}
+
+bool CC1101::reset()
+{
+  // Chip reset sequence. CS wiggle (CC1101 manual page 45)
+
+  //this->disable(); // esp-idf calls end_transaction and asserts, because no begin_transaction was called
   this->cs_->digital_write(false);
-  delayMicroseconds(1);
+  delayMicroseconds(5);
+  //this->enable();
   this->cs_->digital_write(true);
+  delayMicroseconds(10);
+  //this->disable();
+  this->cs_->digital_write(false);
   delayMicroseconds(41);
-  this->cs_->digital_write(false);
-  delay(5);
+  
+  this->send_cmd(CC1101_SRES);
 
-  this->strobe_(Command::RES);
-  delay(5);
+  ESP_LOGD(TAG, "Issued CC1101 reset sequence.");
 
-  this->read_(Register::PARTNUM);
-  this->read_(Register::VERSION);
-  this->chip_id_ = encode_uint16(this->state_.PARTNUM, this->state_.VERSION);
-  ESP_LOGD(TAG, "CC1101 found! Chip ID: 0x%04X", this->chip_id_);
-  if (this->state_.VERSION == 0 || this->state_.PARTNUM == 0xFF) {
-    ESP_LOGE(TAG, "Failed to verify CC1101.");
-    this->mark_failed();
-    return;
-  }
+  // Read part number and version
 
-  this->initialized_ = true;
+  this->partnum_ = this->read_status_register(CC1101_PARTNUM);
+  this->version_ = this->read_status_register(CC1101_VERSION);
 
-  for (uint8_t i = 0; i <= static_cast<uint8_t>(Register::TEST0); i++) {
-    if (i == static_cast<uint8_t>(Register::FSTEST) || i == static_cast<uint8_t>(Register::AGCTEST)) {
-      continue;
-    }
-    this->write_(static_cast<Register>(i));
-  }
-  this->set_output_power(this->output_power_requested_);
+  ESP_LOGI(TAG, "CC1101 found with partnum: %02x and version: %02x", this->partnum_, this->version_);
 
-  if (!this->enter_rx_()) {
-    this->mark_failed();
-    return;
-  }
+  return this->version_ > 0;
 }
 
-void CC1101Component::call_listeners_(const std::vector<uint8_t> &packet, float freq_offset, float rssi, uint8_t lqi) {
-  for (auto &listener : this->listeners_) {
-    listener->on_packet(packet, freq_offset, rssi, lqi);
-  }
-  this->packet_trigger_.trigger(packet, freq_offset, rssi, lqi);
-}
-
-void CC1101Component::loop() {
-  this->disable_loop();
-  if (this->state_.PKT_FORMAT != static_cast<uint8_t>(PacketFormat::PACKET_FORMAT_FIFO) || this->gdo0_pin_ == nullptr ||
-      !this->gdo0_pin_->digital_read()) {
-    return;
-  }
-
-  // Read state
-  this->read_(Register::RXBYTES);
-  uint8_t rx_bytes = this->state_.NUM_RXBYTES;
-  bool overflow = this->state_.RXFIFO_OVERFLOW;
-  if (overflow || rx_bytes == 0) {
-    ESP_LOGW(TAG, "RX FIFO overflow, flushing");
-    this->enter_idle_();
-    this->strobe_(Command::FRX);
-    this->enter_rx_();
-    return;
-  }
-
-  // Read packet
-  uint8_t payload_length, expected_rx;
-  if (this->state_.LENGTH_CONFIG == static_cast<uint8_t>(LengthConfig::LENGTH_CONFIG_VARIABLE)) {
-    this->read_(Register::FIFO, &payload_length, 1);
-    expected_rx = payload_length + 1;
-  } else {
-    payload_length = this->state_.PKTLEN;
-    expected_rx = payload_length;
-  }
-  if (payload_length == 0 || payload_length > 64 || rx_bytes != expected_rx) {
-    ESP_LOGW(TAG, "Invalid packet: rx_bytes %u, payload_length %u", rx_bytes, payload_length);
-    this->enter_idle_();
-    this->strobe_(Command::FRX);
-    this->enter_rx_();
-    return;
-  }
-  this->packet_.resize(payload_length);
-  this->read_(Register::FIFO, this->packet_.data(), payload_length);
-
-  // Read status from registers (more reliable than FIFO status bytes due to timing issues)
-  this->read_(Register::FREQEST);
-  this->read_(Register::RSSI);
-  this->read_(Register::LQI);
-  float freq_offset = static_cast<int8_t>(this->state_.FREQEST) * (XTAL_FREQUENCY / (1 << 14));
-  float rssi = (this->state_.RSSI * RSSI_STEP) - RSSI_OFFSET;
-  bool crc_ok = (this->state_.LQI & STATUS_CRC_OK_MASK) != 0;
-  uint8_t lqi = this->state_.LQI & STATUS_LQI_MASK;
-  if (this->state_.CRC_EN == 0 || crc_ok) {
-    this->call_listeners_(this->packet_, freq_offset, rssi, lqi);
-  }
-
-  // Return to rx
-  this->enter_idle_();
-  this->strobe_(Command::FRX);
-  this->enter_rx_();
-}
-
-void CC1101Component::dump_config() {
-  static const char *const MODULATION_NAMES[] = {"2-FSK", "GFSK",   "UNUSED", "ASK/OOK",
-                                                 "4-FSK", "UNUSED", "UNUSED", "MSK"};
-  int32_t freq = static_cast<int32_t>(this->state_.FREQ2 << 16 | this->state_.FREQ1 << 8 | this->state_.FREQ0) *
-                 XTAL_FREQUENCY / (1 << 16);
-  float symbol_rate = (((256.0f + this->state_.DRATE_M) * (1 << this->state_.DRATE_E)) / (1 << 28)) * XTAL_FREQUENCY;
-  float bw = XTAL_FREQUENCY / (8.0f * (4 + this->state_.CHANBW_M) * (1 << this->state_.CHANBW_E));
-  ESP_LOGCONFIG(TAG,
-                "CC1101:\n"
-                "  Chip ID: 0x%04X\n"
-                "  Frequency: %" PRId32 " Hz\n"
-                "  Channel: %u\n"
-                "  Modulation: %s\n"
-                "  Symbol Rate: %.0f baud\n"
-                "  Filter Bandwidth: %.1f Hz\n"
-                "  Output Power: %.1f dBm",
-                this->chip_id_, freq, this->state_.CHANNR, MODULATION_NAMES[this->state_.MOD_FORMAT & 0x07],
-                symbol_rate, bw, this->output_power_effective_);
-  LOG_PIN("  CS Pin: ", this->cs_);
-}
-
-void CC1101Component::begin_tx() {
-  // Ensure Packet Format is 3 (Async Serial)
-  this->write_(Register::PKTCTRL0, 0x32);
-  ESP_LOGV(TAG, "Beginning TX sequence");
-  if (this->gdo0_pin_ != nullptr) {
-    this->gdo0_pin_->detach_interrupt();
-    this->gdo0_pin_->pin_mode(gpio::FLAG_OUTPUT);
-  }
-  // Transition through IDLE to bypass CCA (Clear Channel Assessment) which can
-  // block TX entry when strobing from RX, and to ensure FS_AUTOCAL calibration
-  this->enter_idle_();
-  if (!this->enter_tx_()) {
-    ESP_LOGW(TAG, "Failed to enter TX state!");
-  }
-}
-
-void CC1101Component::begin_rx() {
-  ESP_LOGV(TAG, "Beginning RX sequence");
-  if (this->gdo0_pin_ != nullptr) {
-    this->gdo0_pin_->pin_mode(gpio::FLAG_INPUT);
-  }
-  // Transition through IDLE to ensure FS_AUTOCAL calibration occurs
-  this->enter_idle_();
-  if (!this->enter_rx_()) {
-    ESP_LOGW(TAG, "Failed to enter RX state!");
-  }
-}
-
-void CC1101Component::reset() {
-  this->strobe_(Command::RES);
-  this->configure();
-}
-
-void CC1101Component::set_idle() {
-  ESP_LOGV(TAG, "Setting IDLE state");
-  this->enter_idle_();
-}
-
-bool CC1101Component::wait_for_state_(State target_state, uint32_t timeout_ms) {
-  uint32_t start = millis();
-  while (millis() - start < timeout_ms) {
-    this->read_(Register::MARCSTATE);
-    State s = static_cast<State>(this->state_.MARC_STATE);
-    if (s == target_state) {
-      return true;
-    }
-    delayMicroseconds(100);
-  }
-  return false;
-}
-
-bool CC1101Component::enter_calibrated_(State target_state, Command cmd) {
-  // The PLL must be recalibrated until PLL lock is achieved
-  for (uint8_t retries = PLL_LOCK_RETRIES; retries > 0; retries--) {
-    this->strobe_(cmd);
-    if (!this->wait_for_state_(target_state)) {
-      return false;
-    }
-    this->read_(Register::FSCAL1);
-    if (this->state_.FSCAL1 != FSCAL1_PLL_NOT_LOCKED) {
-      return true;
-    }
-    ESP_LOGW(TAG, "PLL lock failed, retrying calibration");
-    this->enter_idle_();
-  }
-  ESP_LOGE(TAG, "PLL lock failed after retries");
-  return false;
-}
-
-void CC1101Component::enter_idle_() {
-  this->strobe_(Command::IDLE);
-  this->wait_for_state_(State::IDLE);
-}
-
-bool CC1101Component::enter_rx_() { return this->enter_calibrated_(State::RX, Command::RX); }
-
-bool CC1101Component::enter_tx_() { return this->enter_calibrated_(State::TX, Command::TX); }
-
-uint8_t CC1101Component::strobe_(Command cmd) {
-  uint8_t index = static_cast<uint8_t>(cmd);
-  if (cmd < Command::RES || cmd > Command::NOP) {
-    return 0xFF;
-  }
+void CC1101::send_cmd(uint8_t cmd)
+{
   this->enable();
-  uint8_t status_byte = this->transfer_byte(index);
-  this->disable();
-  return status_byte;
-}
-
-void CC1101Component::write_(Register reg) {
-  uint8_t index = static_cast<uint8_t>(reg);
-  this->enable();
-  this->write_byte(index);
-  this->write_array(&this->state_.regs()[index], 1);
+  this->transfer_byte(cmd);
   this->disable();
 }
 
-void CC1101Component::write_(Register reg, uint8_t value) {
-  uint8_t index = static_cast<uint8_t>(reg);
-  this->state_.regs()[index] = value;
-  this->write_(reg);
-}
-
-void CC1101Component::write_(Register reg, const uint8_t *buffer, size_t length) {
-  uint8_t index = static_cast<uint8_t>(reg);
+uint8_t CC1101::read_register(uint8_t reg)
+{
   this->enable();
-  this->write_byte(index | BUS_WRITE | BUS_BURST);
-  this->write_array(buffer, length);
+  this->transfer_byte(reg);
+  uint8_t value = this->transfer_byte(0);
   this->disable();
+  return value;
 }
 
-void CC1101Component::read_(Register reg) {
-  uint8_t index = static_cast<uint8_t>(reg);
-  this->enable();
-  this->write_byte(index | BUS_READ | BUS_BURST);
-  this->state_.regs()[index] = this->transfer_byte(0);
-  this->disable();
+uint8_t CC1101::read_config_register(uint8_t reg)
+{
+  return this->read_register(reg | CC1101_READ_SINGLE);
 }
 
-void CC1101Component::read_(Register reg, uint8_t *buffer, size_t length) {
-  uint8_t index = static_cast<uint8_t>(reg);
+uint8_t CC1101::read_status_register(uint8_t reg)
+{
+  return this->read_register(reg | CC1101_READ_BURST);
+}
+
+void CC1101::read_register_burst(uint8_t reg, uint8_t* buffer, size_t length)
+{
   this->enable();
-  this->write_byte(index | BUS_READ | BUS_BURST);
+  this->write_byte(reg | CC1101_READ_BURST);
   this->read_array(buffer, length);
   this->disable();
 }
-
-CC1101Error CC1101Component::transmit_packet(const std::vector<uint8_t> &packet) {
-  if (this->state_.PKT_FORMAT != static_cast<uint8_t>(PacketFormat::PACKET_FORMAT_FIFO)) {
-    return CC1101Error::PARAMS;
-  }
-
-  // Write packet
-  this->enter_idle_();
-  this->strobe_(Command::FTX);
-  if (this->state_.LENGTH_CONFIG == static_cast<uint8_t>(LengthConfig::LENGTH_CONFIG_VARIABLE)) {
-    this->write_(Register::FIFO, static_cast<uint8_t>(packet.size()));
-  }
-  this->write_(Register::FIFO, packet.data(), packet.size());
-
-  // Calibrate PLL
-  if (!this->enter_calibrated_(State::FSTXON, Command::FSTXON)) {
-    ESP_LOGW(TAG, "PLL lock failed during TX");
-    this->enter_idle_();
-    this->enter_rx_();
-    return CC1101Error::PLL_LOCK;
-  }
-
-  // Transmit packet
-  this->strobe_(Command::TX);
-  if (!this->wait_for_state_(State::IDLE, 1000)) {
-    ESP_LOGW(TAG, "TX timeout");
-    this->enter_idle_();
-    this->enter_rx_();
-    return CC1101Error::TIMEOUT;
-  }
-
-  // Return to rx
-  this->enter_rx_();
-  return CC1101Error::NONE;
+void CC1101::write_register(uint8_t reg, uint8_t* value, size_t length)
+{
+  this->enable();
+  this->transfer_byte(reg);
+  this->transfer_array(value, length);
+  this->disable();
 }
 
-// Setters
-void CC1101Component::set_output_power(float value) {
-  this->output_power_requested_ = value;
-  int32_t freq = static_cast<int32_t>(this->state_.FREQ2 << 16 | this->state_.FREQ1 << 8 | this->state_.FREQ0) *
-                 XTAL_FREQUENCY / (1 << 16);
-  uint8_t a = 0xC0;
-  if (freq >= 300000000 && freq <= 348000000) {
-    a = PowerTableItem::find(PA_TABLE_315, sizeof(PA_TABLE_315) / sizeof(PA_TABLE_315[0]), value);
-  } else if (freq >= 378000000 && freq <= 464000000) {
-    a = PowerTableItem::find(PA_TABLE_433, sizeof(PA_TABLE_433) / sizeof(PA_TABLE_433[0]), value);
-  } else if (freq >= 779000000 && freq < 900000000) {
-    a = PowerTableItem::find(PA_TABLE_868, sizeof(PA_TABLE_868) / sizeof(PA_TABLE_868[0]), value);
-  } else if (freq >= 900000000 && freq <= 928000000) {
-    a = PowerTableItem::find(PA_TABLE_915, sizeof(PA_TABLE_915) / sizeof(PA_TABLE_915[0]), value);
-  }
-
-  if (static_cast<Modulation>(this->state_.MOD_FORMAT) == Modulation::MODULATION_ASK_OOK) {
-    this->pa_table_[0] = 0;
-    this->pa_table_[1] = a;
-  } else {
-    this->pa_table_[0] = a;
-    this->pa_table_[1] = 0;
-  }
-  this->output_power_effective_ = value;
-  if (this->initialized_) {
-    this->write_(Register::PATABLE, this->pa_table_, sizeof(this->pa_table_));
-  }
+void CC1101::write_register(uint8_t reg, uint8_t value)
+{
+  uint8_t arr[1] = {value};
+  this->write_register(reg, arr, 1);
 }
 
-void CC1101Component::set_rx_attenuation(RxAttenuation value) {
-  this->state_.CLOSE_IN_RX = static_cast<uint8_t>(value);
-  if (this->initialized_) {
-    this->write_(Register::FIFOTHR);
+void CC1101::write_register_burst(uint8_t reg, uint8_t* buffer, size_t length)
+{
+  this->write_register(reg | CC1101_WRITE_BURST, buffer, length);
+}
+/*
+bool CC1101::send_data(const uint8_t* data, size_t length)
+{
+  uint8_t buffer[length];
+  
+  memcpy(buffer, data, lenght);
+
+  this->send_cmd(CC1101_SIDLE);
+  this->send_cmd(CC1101_SFRX);
+  this->send_cmd(CC1101_SFTX);
+
+  this->write_register_burst(CC1101_TXFIFO, buffer, length);
+
+  this->send_cmd(CC1101_STX);
+
+  uint8_t state = this->read_status_register(CC1101_MARCSTATE) & 0x1f;
+
+  if(state != CC1101_MARCSTATE_TX && state != CC1101_MARCSTATE_TX_END && state != CC1101_MARCSTATE_RXTX_SWITCH)
+  {
+    ESP_LOGE(TAG, "CC1101 in invalid state after sending, returning to idle. State: 0x%02x", state);
+    this->send_cmd(CC1101_SIDLE);
+    return false;
   }
+
+  return true;
+}
+*/
+
+// ELECHOUSE_CC1101 stuff
+
+void CC1101::set_mode(bool s)
+{
+  this->mode_ = s;
+
+  if(s)
+  {
+    this->write_register(CC1101_IOCFG2, 0x0B);
+    this->write_register(CC1101_IOCFG0, 0x06);
+    this->write_register(CC1101_PKTCTRL0, 0x05);
+    this->write_register(CC1101_MDMCFG3, 0xF8);
+    this->write_register(CC1101_MDMCFG4, 11 + this->m4RxBw_);
+  }
+  else
+  {
+    this->write_register(CC1101_IOCFG2, 0x0D);
+    this->write_register(CC1101_IOCFG0, 0x0D);
+    this->write_register(CC1101_PKTCTRL0, 0x32);
+    this->write_register(CC1101_MDMCFG3, 0x93);
+    this->write_register(CC1101_MDMCFG4, 7 + this->m4RxBw_);
+  }
+  
+  this->set_modulation(this->modulation_);
 }
 
-void CC1101Component::set_dc_blocking_filter(bool value) {
-  this->state_.DEM_DCFILT_OFF = value ? 0 : 1;
-  if (this->initialized_) {
-    this->write_(Register::MDMCFG2);
+void CC1101::set_modulation(uint8_t m)
+{
+  if(m > 4) m = 4;
+
+  this->modulation_ = m;
+
+  this->split_MDMCFG2();
+
+  switch(m)
+  {
+  case 0: this->m2MODFM_ = 0x00; this->frend0_ = 0x10; break; // 2-FSK
+  case 1: this->m2MODFM_ = 0x10; this->frend0_ = 0x10; break; // GFSK
+  case 2: this->m2MODFM_ = 0x30; this->frend0_ = 0x11; break; // ASK
+  case 3: this->m2MODFM_ = 0x40; this->frend0_ = 0x10; break; // 4-FSK
+  case 4: this->m2MODFM_ = 0x70; this->frend0_ = 0x10; break; // MSK
   }
+
+  this->write_register(CC1101_MDMCFG2, this->m2DCOFF_ + this->m2MODFM_ + this->m2MANCH_ + this->m2SYNCM_);
+  this->write_register(CC1101_FREND0, this->frend0_);
+
+  this->set_pa(this->pa_);
 }
 
-void CC1101Component::set_frequency(float value) {
-  int32_t freq = static_cast<int32_t>(value * (1 << 16) / XTAL_FREQUENCY);
-  this->state_.FREQ2 = static_cast<uint8_t>(freq >> 16);
-  this->state_.FREQ1 = static_cast<uint8_t>(freq >> 8);
-  this->state_.FREQ0 = static_cast<uint8_t>(freq);
-  if (this->initialized_) {
-    this->enter_idle_();
-    this->write_(Register::FREQ2);
-    this->write_(Register::FREQ1);
-    this->write_(Register::FREQ0);
-    this->enter_rx_();
+void CC1101::set_pa(int8_t pa)
+{
+  this->pa_ = pa;
+
+  int a;
+
+  if(this->frequency_ >= 300000 && this->frequency_ <= 348000)
+  {
+    if(pa <= -30) a = PA_TABLE_315[0];
+    else if(pa > -30 && pa <= -20) a = PA_TABLE_315[1];
+    else if(pa > -20 && pa <= -15) a = PA_TABLE_315[2];
+    else if(pa > -15 && pa <= -10) a = PA_TABLE_315[3];
+    else if(pa > -10 && pa <= 0) a = PA_TABLE_315[4];
+    else if(pa > 0 && pa <= 5) a = PA_TABLE_315[5];
+    else if(pa > 5 && pa <= 7) a = PA_TABLE_315[6];
+    else a = PA_TABLE_315[7];
+    this->last_pa_ = 1;
   }
+  else if(this->frequency_ >= 378000 && this->frequency_ <= 464000)
+  {
+    if(pa <= -30) a = PA_TABLE_433[0];
+    else if(pa > -30 && pa <= -20) a = PA_TABLE_433[1];
+    else if(pa > -20 && pa <= -15) a = PA_TABLE_433[2];
+    else if(pa > -15 && pa <= -10) a = PA_TABLE_433[3];
+    else if(pa > -10 && pa <= 0) a = PA_TABLE_433[4];
+    else if(pa > 0 && pa <= 5) a = PA_TABLE_433[5];
+    else if(pa > 5 && pa <= 7) a = PA_TABLE_433[6];
+    else a = PA_TABLE_433[7];
+    this->last_pa_ = 2;
+  }
+  else if(this->frequency_ >= 779000 && this->frequency_ < 900000)
+  {
+    if(pa <= -30) a = PA_TABLE_868[0];
+    else if(pa > -30 && pa <= -20) a = PA_TABLE_868[1];
+    else if(pa > -20 && pa <= -15) a = PA_TABLE_868[2];
+    else if(pa > -15 && pa <= -10) a = PA_TABLE_868[3];
+    else if(pa > -10 && pa <= -6) a = PA_TABLE_868[4];
+    else if(pa > -6 && pa <= 0) a = PA_TABLE_868[5];
+    else if(pa > 0 && pa <= 5) a = PA_TABLE_868[6];
+    else if(pa > 5 && pa <= 7) a = PA_TABLE_868[7];
+    else if(pa > 7 && pa <= 10) a = PA_TABLE_868[8];
+    else a = PA_TABLE_868[9];
+    this->last_pa_ = 3;
+  }
+  else if(this->frequency_ >= 900000 && this->frequency_ <= 928000)
+  {
+    if(pa <= -30) a = PA_TABLE_915[0];
+    else if(pa > -30 && pa <= -20) a = PA_TABLE_915[1];
+    else if(pa > -20 && pa <= -15) a = PA_TABLE_915[2];
+    else if(pa > -15 && pa <= -10) a = PA_TABLE_915[3];
+    else if(pa > -10 && pa <= -6) a = PA_TABLE_915[4];
+    else if(pa > -6 && pa <= 0) a = PA_TABLE_915[5];
+    else if(pa > 0 && pa <= 5) a = PA_TABLE_915[6];
+    else if(pa > 5 && pa <= 7) a = PA_TABLE_915[7];
+    else if(pa > 7 && pa <= 10) a = PA_TABLE_915[8];
+    else a = PA_TABLE_915[9];
+    this->last_pa_ = 4;
+  }
+  else
+  {
+    ESP_LOGE(TAG, "CC1101 set_pa(%d) frequency out of range: %d", pa, this->frequency_);
+    return;
+  }
+
+  if(this->modulation_ == 2)
+  {
+    PA_TABLE[0] = 0;
+    PA_TABLE[1] = a;
+  }
+  else
+  {
+    PA_TABLE[0] = a;
+    PA_TABLE[1] = 0;
+  }
+
+  this->write_register_burst(CC1101_PATABLE, PA_TABLE, sizeof(PA_TABLE));
 }
 
-void CC1101Component::set_if_frequency(float value) {
-  this->state_.FREQ_IF = value * (1 << 10) / XTAL_FREQUENCY;
-  if (this->initialized_) {
-    this->write_(Register::FSCTRL1);
-  }
-}
+void CC1101::set_frequency(uint32_t f)
+{
+  this->frequency_ = f;
 
-void CC1101Component::set_filter_bandwidth(float value) {
-  uint8_t e;
-  uint32_t m;
-  split_float(XTAL_FREQUENCY / (value * 8), 2, e, m);
-  this->state_.CHANBW_E = e;
-  this->state_.CHANBW_M = static_cast<uint8_t>(m);
-  if (this->initialized_) {
-    this->write_(Register::MDMCFG4);
-  }
-}
+  uint8_t freq2 = 0;
+  uint8_t freq1 = 0;
+  uint8_t freq0 = 0;
 
-void CC1101Component::set_channel(uint8_t value) {
-  this->state_.CHANNR = value;
-  if (this->initialized_) {
-    this->enter_idle_();
-    this->write_(Register::CHANNR);
-    this->enter_rx_();
-  }
-}
+  float mhz = (float)f / 1000;
 
-void CC1101Component::set_channel_spacing(float value) {
-  uint8_t e;
-  uint32_t m;
-  split_float(value * (1 << 18) / XTAL_FREQUENCY, 8, e, m);
-  this->state_.CHANSPC_E = e;
-  this->state_.CHANSPC_M = static_cast<uint8_t>(m);
-  if (this->initialized_) {
-    this->write_(Register::MDMCFG1);
-    this->write_(Register::MDMCFG0);
+  while(true)
+  {
+    if(mhz >= 26) { mhz -= 26; freq2++; }
+    else if(mhz >= 0.1015625) { mhz -= 0.1015625; freq1++; }
+    else if(mhz >= 0.00039675) { mhz -= 0.00039675; freq0++; }
+    else break;
   }
-}
 
-void CC1101Component::set_fsk_deviation(float value) {
-  uint8_t e;
-  uint32_t m;
-  split_float(value * (1 << 17) / XTAL_FREQUENCY, 3, e, m);
-  this->state_.DEVIATION_E = e;
-  this->state_.DEVIATION_M = static_cast<uint8_t>(m);
-  if (this->initialized_) {
-    this->write_(Register::DEVIATN);
+  /*
+  // TODO: impossible, freq0 being uint8_t, also 0.1015625/0.00039675 = 255.9861373660996, it would never reach 256
+  if(freq0 > 255)
+  {
+    freq1 += 1;
+    freq0 -= 256;
   }
-}
+  */
 
-void CC1101Component::set_msk_deviation(uint8_t value) {
-  this->state_.DEVIATION_E = 0;
-  this->state_.DEVIATION_M = value - 1;
-  if (this->initialized_) {
-    this->write_(Register::DEVIATN);
-  }
-}
+  this->write_register(CC1101_FREQ2, freq2);
+  this->write_register(CC1101_FREQ1, freq1);
+  this->write_register(CC1101_FREQ0, freq0);
 
-void CC1101Component::set_symbol_rate(float value) {
-  uint8_t e;
-  uint32_t m;
-  split_float(value * (1 << 28) / XTAL_FREQUENCY, 8, e, m);
-  this->state_.DRATE_E = e;
-  this->state_.DRATE_M = static_cast<uint8_t>(m);
-  if (this->initialized_) {
-    this->write_(Register::MDMCFG4);
-    this->write_(Register::MDMCFG3);
-  }
-}
+  // calibrate
 
-void CC1101Component::set_sync_mode(SyncMode value) {
-  this->state_.SYNC_MODE = static_cast<uint8_t>(value);
-  if (this->initialized_) {
-    this->write_(Register::MDMCFG2);
-  }
-}
+  mhz = (float)f / 1000;
 
-void CC1101Component::set_carrier_sense_above_threshold(bool value) {
-  this->state_.CARRIER_SENSE_ABOVE_THRESHOLD = value ? 1 : 0;
-  if (this->initialized_) {
-    this->write_(Register::MDMCFG2);
-  }
-}
+  if(mhz >= 300 && mhz <= 348)
+  {
+    this->write_register(CC1101_FSCTRL0, map(mhz, 300, 348, this->clb_[0][0], this->clb_[0][1]));
 
-void CC1101Component::set_modulation_type(Modulation value) {
-  this->state_.MOD_FORMAT = static_cast<uint8_t>(value);
-  this->state_.PA_POWER = value == Modulation::MODULATION_ASK_OOK ? 1 : 0;
-  if (this->initialized_) {
-    this->enter_idle_();
-    this->set_output_power(this->output_power_requested_);
-    this->write_(Register::MDMCFG2);
-    this->write_(Register::FREND0);
-    this->enter_rx_();
-  }
-}
-
-void CC1101Component::set_manchester(bool value) {
-  this->state_.MANCHESTER_EN = value ? 1 : 0;
-  if (this->initialized_) {
-    this->write_(Register::MDMCFG2);
-  }
-}
-
-void CC1101Component::set_num_preamble(uint8_t value) {
-  this->state_.NUM_PREAMBLE = value;
-  if (this->initialized_) {
-    this->write_(Register::MDMCFG1);
-  }
-}
-
-void CC1101Component::set_sync1(uint8_t value) {
-  this->state_.SYNC1 = value;
-  if (this->initialized_) {
-    this->write_(Register::SYNC1);
-  }
-}
-
-void CC1101Component::set_sync0(uint8_t value) {
-  this->state_.SYNC0 = value;
-  if (this->initialized_) {
-    this->write_(Register::SYNC0);
-  }
-}
-
-void CC1101Component::set_magn_target(MagnTarget value) {
-  this->state_.MAGN_TARGET = static_cast<uint8_t>(value);
-  if (this->initialized_) {
-    this->write_(Register::AGCCTRL2);
-  }
-}
-
-void CC1101Component::set_max_lna_gain(MaxLnaGain value) {
-  this->state_.MAX_LNA_GAIN = static_cast<uint8_t>(value);
-  if (this->initialized_) {
-    this->write_(Register::AGCCTRL2);
-  }
-}
-
-void CC1101Component::set_max_dvga_gain(MaxDvgaGain value) {
-  this->state_.MAX_DVGA_GAIN = static_cast<uint8_t>(value);
-  if (this->initialized_) {
-    this->write_(Register::AGCCTRL2);
-  }
-}
-
-void CC1101Component::set_carrier_sense_abs_thr(int8_t value) {
-  this->state_.CARRIER_SENSE_ABS_THR = static_cast<uint8_t>(value & 0b1111);
-  if (this->initialized_) {
-    this->write_(Register::AGCCTRL1);
-  }
-}
-
-void CC1101Component::set_carrier_sense_rel_thr(CarrierSenseRelThr value) {
-  this->state_.CARRIER_SENSE_REL_THR = static_cast<uint8_t>(value);
-  if (this->initialized_) {
-    this->write_(Register::AGCCTRL1);
-  }
-}
-
-void CC1101Component::set_lna_priority(bool value) {
-  this->state_.AGC_LNA_PRIORITY = value ? 1 : 0;
-  if (this->initialized_) {
-    this->write_(Register::AGCCTRL1);
-  }
-}
-
-void CC1101Component::set_filter_length_fsk_msk(FilterLengthFskMsk value) {
-  this->state_.FILTER_LENGTH = static_cast<uint8_t>(value);
-  if (this->initialized_) {
-    this->write_(Register::AGCCTRL0);
-  }
-}
-
-void CC1101Component::set_filter_length_ask_ook(FilterLengthAskOok value) {
-  this->state_.FILTER_LENGTH = static_cast<uint8_t>(value);
-  if (this->initialized_) {
-    this->write_(Register::AGCCTRL0);
-  }
-}
-
-void CC1101Component::set_freeze(Freeze value) {
-  this->state_.AGC_FREEZE = static_cast<uint8_t>(value);
-  if (this->initialized_) {
-    this->write_(Register::AGCCTRL0);
-  }
-}
-
-void CC1101Component::set_wait_time(WaitTime value) {
-  this->state_.WAIT_TIME = static_cast<uint8_t>(value);
-  if (this->initialized_) {
-    this->write_(Register::AGCCTRL0);
-  }
-}
-
-void CC1101Component::set_hyst_level(HystLevel value) {
-  this->state_.HYST_LEVEL = static_cast<uint8_t>(value);
-  if (this->initialized_) {
-    this->write_(Register::AGCCTRL0);
-  }
-}
-
-void CC1101Component::set_packet_mode(bool value) {
-  this->state_.PKT_FORMAT =
-      static_cast<uint8_t>(value ? PacketFormat::PACKET_FORMAT_FIFO : PacketFormat::PACKET_FORMAT_ASYNC_SERIAL);
-  if (value) {
-    // Configure GDO0 for FIFO status (asserts on RX FIFO threshold or end of packet)
-    this->state_.GDO0_CFG = 0x01;
-    // Set max RX FIFO threshold to ensure we only trigger on end-of-packet
-    this->state_.FIFO_THR = 15;
-    // Don't append status bytes to FIFO - we read from registers instead
-    this->state_.APPEND_STATUS = 0;
-  } else {
-    // Configure GDO0 for serial data (async serial mode)
-    this->state_.GDO0_CFG = 0x0D;
-  }
-  if (this->initialized_) {
-    if (this->gdo0_pin_ != nullptr) {
-      if (value) {
-        this->gdo0_pin_->attach_interrupt(&CC1101Component::gpio_intr, this, gpio::INTERRUPT_RISING_EDGE);
-      } else {
-        this->gdo0_pin_->detach_interrupt();
-      }
+    if(mhz < 322.88)
+    {
+      this->write_register(CC1101_TEST0, 0x0B);
     }
-    this->write_(Register::PKTCTRL0);
-    this->write_(Register::PKTCTRL1);
-    this->write_(Register::IOCFG0);
-    this->write_(Register::FIFOTHR);
+    else
+    {
+      this->write_register(CC1101_TEST0, 0x09);
+
+      uint8_t s = this->read_status_register(CC1101_FSCAL2);
+
+      if(s < 32)
+      {
+        this->write_register(CC1101_FSCAL2, s + 32);
+      }
+
+      if(this->last_pa_ != 1) this->set_pa(this->pa_);
+    }
+  }
+  else if(mhz >= 378 && mhz <= 464)
+  {
+    this->write_register(CC1101_FSCTRL0, map(mhz, 378, 464, this->clb_[1][0], this->clb_[1][1]));
+
+    if(mhz < 430.5)
+    {
+      this->write_register(CC1101_TEST0, 0x0B);
+    }
+    else
+    {
+      this->write_register(CC1101_TEST0, 0x09);
+
+      uint8_t s = this->read_status_register(CC1101_FSCAL2);
+
+      if(s < 32)
+      {
+        this->write_register(CC1101_FSCAL2, s + 32);
+      }
+
+      if(this->last_pa_ != 2) this->set_pa(this->pa_);
+    }
+  }
+  else if(mhz >= 779 && mhz <= 899.99)
+  {
+    this->write_register(CC1101_FSCTRL0, map(mhz, 779, 899, this->clb_[2][0], this->clb_[2][1]));
+
+    if(mhz < 861)
+    {
+      this->write_register(CC1101_TEST0, 0x0B);
+    }
+    else
+    {
+      this->write_register(CC1101_TEST0, 0x09);
+
+      uint8_t s = this->read_status_register(CC1101_FSCAL2);
+
+      if(s < 32)
+      {
+        this->write_register(CC1101_FSCAL2, s + 32);
+      }
+
+      if(this->last_pa_ != 3) this->set_pa(this->pa_);
+    }
+  }
+  else if(mhz >= 900 && mhz <= 928)
+  {
+    this->write_register(CC1101_FSCTRL0, map(mhz, 900, 928, this->clb_[3][0], this->clb_[3][1]));
+    this->write_register(CC1101_TEST0, 0x09);
+
+    uint8_t s = this->read_status_register(CC1101_FSCAL2);
+    
+    if(s < 32)
+    {
+      this->write_register(CC1101_FSCAL2, s + 32);
+    }
+
+    if(this->last_pa_ != 4) this->set_pa(this->pa_);
   }
 }
 
-void CC1101Component::set_packet_length(uint8_t value) {
-  if (value == 0) {
-    this->state_.LENGTH_CONFIG = static_cast<uint8_t>(LengthConfig::LENGTH_CONFIG_VARIABLE);
-  } else {
-    this->state_.LENGTH_CONFIG = static_cast<uint8_t>(LengthConfig::LENGTH_CONFIG_FIXED);
-    this->state_.PKTLEN = value;
-  }
-  if (this->initialized_) {
-    this->write_(Register::PKTCTRL0);
-    this->write_(Register::PKTLEN);
+void CC1101::set_clb(uint8_t b, uint8_t s, uint8_t e)
+{
+  if(b < 4) 
+  {
+    this->clb_[b][0] = s;
+    this->clb_[b][1] = e;
   }
 }
 
-void CC1101Component::set_crc_enable(bool value) {
-  this->state_.CRC_EN = value ? 1 : 0;
-  if (this->initialized_) {
-    this->write_(Register::PKTCTRL0);
+void CC1101::set_rxbw(uint32_t bw)
+{
+  this->bandwidth_ = bw;
+
+  float f = (float)this->bandwidth_;
+
+  int s1 = 3;
+  int s2 = 3;
+
+  for(int i = 0; i < 3 && f > 101.5625f; i++)
+  {
+    f /= 2;
+    s1--;
+  }
+
+  for(int i = 0; i < 3 && f > 58.1f; i++)
+  {
+    f /= 1.25f;
+    s2--;
+  }
+
+  this->split_MDMCFG4();
+
+  this->m4RxBw_ = (s1 << 6) | (s2 << 4);
+
+  this->write_register(CC1101_MDMCFG4, this->m4RxBw_ + this->m4DaRa_);
+}
+
+void CC1101::set_tx()
+{
+  ESP_LOGI(TAG, "CC1101 set_tx");
+  this->send_cmd(CC1101_SIDLE);
+  this->send_cmd(CC1101_STX);
+  this->trxstate_ = 1;
+}
+
+void CC1101::set_rx()
+{
+  ESP_LOGI(TAG, "CC1101 set_rx");
+  this->send_cmd(CC1101_SIDLE);
+  this->send_cmd(CC1101_SRX);
+  this->trxstate_ = 2;
+}
+
+void CC1101::set_sres()
+{
+  this->send_cmd(CC1101_SRES);
+  this->trxstate_ = 0;
+}
+
+void CC1101::set_sidle()
+{
+  this->send_cmd(CC1101_SIDLE);
+  this->trxstate_ = 0;
+}
+
+void CC1101::set_sleep()
+{
+  this->send_cmd(CC1101_SIDLE); // Exit RX / TX, turn off frequency synthesizer and exit
+  this->send_cmd(CC1101_SPWD); // Enter power down mode when CSn goes high.
+  this->trxstate_ = 0;
+}
+
+void CC1101::split_MDMCFG2()
+{
+  uint8_t calc = this->read_status_register(CC1101_MDMCFG2);
+
+  this->m2DCOFF_ = calc & 0x80;
+  this->m2MODFM_ = calc & 0x70;
+  this->m2MANCH_ = calc & 0x08;
+  this->m2SYNCM_ = calc & 0x07;
+}
+
+void CC1101::split_MDMCFG4()
+{
+  uint8_t calc = this->read_status_register(CC1101_MDMCFG4);
+
+  this->m4RxBw_ = calc & 0xf0;
+  this->m4DaRa_ = calc & 0x0f;
+}
+
+int32_t CC1101::get_rssi()
+{
+  int32_t rssi;
+  rssi = this->read_status_register(CC1101_RSSI);
+  if(rssi >= 128) rssi -= 256;
+  return (rssi / 2) - 74;
+}
+
+uint8_t CC1101::get_lqi()
+{
+  return this->read_status_register(CC1101_LQI);
+}
+
+void CC1101::begin_tx()
+{
+  this->set_tx();
+
+  if(this->gdo0_ == this->gdo2_)
+  {
+#ifdef USE_ESP8266
+  #ifdef USE_ARDUINO
+    noInterrupts();
+  #else // USE_ESP_IDF
+    portDISABLE_INTERRUPTS()
+  #endif
+#endif
+    this->gdo0_->pin_mode(gpio::FLAG_OUTPUT);
   }
 }
 
-void CC1101Component::set_whitening(bool value) {
-  this->state_.WHITE_DATA = value ? 1 : 0;
-  if (this->initialized_) {
-    this->write_(Register::PKTCTRL0);
+void CC1101::end_tx()
+{
+  if(this->gdo0_ == this->gdo2_)
+  {
+#ifdef USE_ESP8266
+  #ifdef USE_ARDUINO
+    interrupts();
+  #else // USE_ESP_IDF
+    portENABLE_INTERRUPTS()
+  #endif
+#endif
+    this->gdo0_->pin_mode(gpio::FLAG_INPUT);
   }
+
+  this->set_rx();
+  this->set_rx(); // yes, twice (really?)
 }
 
-}  // namespace esphome::cc1101
+} // namespace cc1101
+} // namespace esphome
