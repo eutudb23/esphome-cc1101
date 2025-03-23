@@ -1,3 +1,5 @@
+from typing import Optional
+
 import esphome.codegen as cg
 from esphome.components import mqtt, text, web_server
 import esphome.config_validation as cv
@@ -13,10 +15,16 @@ from esphome.core import CORE
 from esphome.cpp_generator import MockObjClass
 from esphome.cpp_helpers import setup_entity
 
-from .. import CC1101_COMPONENT_SCHEMA, CONF_CC1101_ID, for_each_conf, ns
+from .. import (
+    CONF_CC1101_ID,
+    CONF_TUNER,
+    ICON_FORMAT_TEXT,
+    CC1101Component,
+    for_each_conf,
+    ns,
+)
 
 CONF_DUMMY_TEXT = "dummy_text"
-ICON_FORMAT_TEXT = "mdi:format-text"
 
 DummyText = ns.class_("DummyText", text.Text)
 
@@ -67,9 +75,9 @@ async def setup_text_core_(
     var,
     config,
     *,
-    min_length: int | None,
-    max_length: int | None,
-    pattern: str | None,
+    min_length: Optional[int],
+    max_length: Optional[int],
+    pattern: Optional[str],
 ):
     await setup_entity(var, config)
     cg.add(var.traits.set_min_length(min_length))
@@ -88,9 +96,9 @@ async def setup_text_core_(
 async def register_text(
     var,
     config,
-    min_length: int | None = 0,
-    max_length: int | None = 255,
-    pattern: str | None = None,
+    min_length: Optional[int] = 0,
+    max_length: Optional[int] = 255,
+    pattern: Optional[str] = None,
 ):
     if not CORE.has_id(config[CONF_ID]):
         var = cg.Pvariable(config[CONF_ID], var)
@@ -100,23 +108,29 @@ async def register_text(
     )
 
 
-TYPES = {
-    None: {
-        CONF_DUMMY_TEXT: [
-            text_schema(
-                DummyText,
-                entity_category=ENTITY_CATEGORY_CONFIG,
-                icon=ICON_FORMAT_TEXT,
-            ),
-            0,
-            64,
-        ]
-    },
-}
-
-CONFIG_SCHEMA = CC1101_COMPONENT_SCHEMA.extend(
-    {cv.Optional(k): v[0] for k, v in TYPES[None].items()},
+TUNER_SCHEMA = cv.Schema(
+    {
+        cv.Optional(CONF_DUMMY_TEXT): text_schema(
+            DummyText,
+            entity_category=ENTITY_CATEGORY_CONFIG,
+            icon=ICON_FORMAT_TEXT,
+        ),
+    }
 )
+
+CONFIG_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(CONF_CC1101_ID): cv.use_id(CC1101Component),
+        cv.Optional(CONF_TUNER): TUNER_SCHEMA,
+    }
+)
+
+VARIABLES = {
+    None: [],
+    CONF_TUNER: [
+        [CONF_DUMMY_TEXT, 0, 64],
+    ],
+}
 
 
 async def to_code(config):
@@ -124,8 +138,8 @@ async def to_code(config):
 
     async def new_text(c, args, setter):
         var = cg.new_Pvariable(c[CONF_ID])
-        await register_text(var, c, min_length=args[0], max_length=args[1])
+        await register_text(var, c, min_length=args[1], max_length=args[2])
         await cg.register_parented(var, parent)
         cg.add(getattr(parent, setter + "_text")(var))
 
-    await for_each_conf(config, TYPES, new_text)
+    await for_each_conf(config, VARIABLES, new_text)
