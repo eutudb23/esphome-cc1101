@@ -19,6 +19,9 @@
 namespace esphome {
 namespace cc1101 {
 
+// Forward declarations
+class CC1101SignalProcessor;
+
 class CC1101Component : public PollingComponent,
                         public spi::SPIDevice<spi::BIT_ORDER_MSB_FIRST, spi::CLOCK_POLARITY_LOW,
                                               spi::CLOCK_PHASE_LEADING, spi::DATA_RATE_1MHZ> {
@@ -35,6 +38,78 @@ class CC1101Component : public PollingComponent,
 
   void begin_tx();
   void end_tx();
+  
+  // Data transmission methods
+  void send_data(const uint8_t *data, size_t length);
+  void send_data(const char *data);
+  void send_data(const uint8_t *data, size_t length, uint32_t timeout_ms);
+  void send_data(const char *data, uint32_t timeout_ms);
+  
+  // FSK transmission with automatic mode switching (async RX -> packet TX -> async RX)
+  void send_data_fsk(const uint8_t *data, size_t length, uint8_t repeat_count = 10);
+  
+  // Data reception methods
+  bool receive_data(uint8_t *data, size_t max_length, size_t *received_length);
+  bool check_receive_flag();
+  bool check_crc();
+  bool check_rx_fifo();
+  void flush_rx_fifo();
+  
+  // Advanced configuration methods
+  void set_sync_word(uint16_t sync_word);
+  void set_packet_format(bool variable_length, bool data_whitening, bool crc_enabled);
+  void set_crc_enabled(bool enabled);
+  void set_data_whitening(bool enabled);
+  void set_manchester_encoding(bool enabled);
+  void set_packet_length(uint8_t length);
+  void set_packet_length_variable();
+  
+  // State management and mode tracking
+  uint8_t get_mode();
+  bool is_idle();
+  bool is_rx();
+  bool is_tx();
+  bool is_calibrating();
+  void wait_for_idle();
+  void wait_for_rx();
+  void wait_for_tx();
+  
+  // Power management methods
+  void sleep();
+  void idle();
+  void reset();
+  void wake_up();
+  bool is_sleeping();
+  
+  // Enhanced frequency calibration for different bands
+  void calibrate_frequency();
+  void calibrate_433mhz();
+  void calibrate_868mhz();
+  void calibrate_915mhz();
+  void set_frequency_band(uint32_t frequency);
+  bool is_frequency_valid(uint32_t frequency);
+  
+  // Basic signal processing capabilities (simplified)
+  void enable_signal_processing(bool enable);
+  void start_learning();
+  void stop_learning();
+  void save_learned_signal(const std::string& name);
+  void transmit_learned_signal(const std::string& name);
+  void start_scanning();
+  void stop_scanning();
+  
+  // Signal processor access
+  CC1101SignalProcessor* get_signal_processor() { return signal_processor_; }
+  void process_raw_pulse_data(const std::vector<int32_t>& pulse_data, float rssi_db);
+  
+  // Frequency-specific PA table optimization
+  void optimize_pa_table_433mhz();
+  void optimize_pa_table_868mhz();
+  void optimize_pa_table_915mhz();
+  void set_pa_table_433mhz();
+  void set_pa_table_868mhz();
+  void set_pa_table_915mhz();
+  void set_custom_pa_table(const uint8_t *pa_table, size_t length);
 
   CC1101_SUB_NUMBER(output_power, float)
   CC1101_SUB_SELECT(rx_attenuation, RxAttenuation)
@@ -82,6 +157,12 @@ class CC1101Component : public PollingComponent,
     struct CC1101State state_;
     uint8_t regs_[sizeof(struct CC1101State) / sizeof(uint8_t)];
   };
+  
+  // Signal processing (simplified)
+  bool signal_processing_enabled_;
+  bool learning_mode_;
+  bool scanning_mode_;
+  CC1101SignalProcessor *signal_processor_;  // Advanced signal processing
 
   void strobe_(Command cmd);
   void write_(Register reg);
@@ -97,6 +178,8 @@ class CC1101Component : public PollingComponent,
   // template specialization here in the header is not supported by the compiler
   void publish_switch_(switch_::Switch *s, bool state);
   void publish_select_(select::Select *s, size_t index);
+  
+  // Signal processing (simplified - no interrupt handler for now)
 };
 
 template<typename... Ts> class BeginTxAction : public Action<Ts...>, public Parented<CC1101Component> {
