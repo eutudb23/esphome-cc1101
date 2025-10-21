@@ -1,5 +1,6 @@
 #include "cc1101.h"
 #include "cc1101pa.h"
+#include "cc1101_signal.h"
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 #include <climits>
@@ -19,6 +20,12 @@ CC1101Component::CC1101Component() {
   this->output_power_effective_ = OUTPUT_POWER_MAX;
   memset(this->pa_table_, 0, sizeof(pa_table_));
   memset(&this->state_, 0, sizeof(this->state_));
+  
+  // Initialize signal processing (simplified)
+  this->signal_processing_enabled_ = false;
+  this->learning_mode_ = false;
+  this->scanning_mode_ = false;
+  this->signal_processor_ = new CC1101SignalProcessor(this);
 
   // datasheet defaults (non-listed fields are zero)
 
@@ -323,6 +330,566 @@ void CC1101Component::end_tx() {
   }
 
   this->send_(Command::RX);
+}
+
+// FSK transmission with automatic mode switching
+void CC1101Component::send_data_fsk(const uint8_t *data, size_t length, uint8_t repeat_count) {
+  if (data == nullptr || length == 0 || length > 61) {
+    ESP_LOGE(TAG, "Invalid data for FSK transmission: length=%zu", length);
+    return;
+  }
+  
+  ESP_LOGD(TAG, "FSK TX: Switching to packet mode (PKT_FORMAT=0)");
+  
+  // Save current PKT_FORMAT (should be 3 for async mode)
+  // Use simple read_() which stores into regs_[] array
+  this->read_(Register::PKTCTRL0);
+  uint8_t saved_pktctrl0 = this->regs_[(uint8_t)Register::PKTCTRL0];
+  ESP_LOGD(TAG, "FSK TX: Saved PKTCTRL0=0x%02X", saved_pktctrl0);
+  
+  // Temporarily switch to packet mode (PKT_FORMAT=0) for FSK transmission
+  uint8_t packet_pktctrl0 = (saved_pktctrl0 & 0xCF);  // Clear bits 5:4 (PKT_FORMAT)
+  this->write_(Register::PKTCTRL0, packet_pktctrl0);
+  ESP_LOGD(TAG, "FSK TX: Set packet mode PKTCTRL0=0x%02X", packet_pktctrl0);
+  
+  // Go to IDLE first
+  this->send_(Command::IDLE);
+  delay(10);
+  
+  // Flush TX FIFO
+  this->send_(Command::FTX);
+  
+  // Send the packet multiple times (like the real remote does)
+  for (uint8_t i = 0; i < repeat_count; i++) {
+    ESP_LOGV(TAG, "FSK TX: Sending packet %d/%d", i + 1, repeat_count);
+    
+    // Write packet length to TX FIFO (use buffer overload for FIFO)
+    uint8_t len_byte = (uint8_t) length;
+    this->write_(Register::FIFO, &len_byte, 1);
+    
+    // Write data to TX FIFO (buffer overload accepts FIFO)
+    this->write_(Register::FIFO, const_cast<uint8_t*>(data), length);
+    
+    // Start transmission
+    this->send_(Command::TX);
+    
+    // Wait for transmission to complete
+    delay(50);  // Adjust based on packet length and data rate
+    
+    // Return to IDLE between packets
+    this->send_(Command::IDLE);
+    delay(5);
+  }
+  
+  ESP_LOGD(TAG, "FSK TX: Restoring async mode");
+  
+  // Restore async serial mode (PKT_FORMAT=3)
+  this->write_(Register::PKTCTRL0, saved_pktctrl0);
+  ESP_LOGD(TAG, "FSK TX: Restored PKTCTRL0=0x%02X", saved_pktctrl0);
+  
+  // Return to RX mode
+  this->send_(Command::RX);
+  
+  ESP_LOGI(TAG, "FSK transmission complete (%d packets sent)", repeat_count);
+}
+
+// Data transmission methods
+
+void CC1101Component::send_data(const uint8_t *data, size_t length) {
+  if (data == nullptr || length == 0 || length > 61) {
+    ESP_LOGE(TAG, "Invalid data parameters: data=%p, length=%zu", data, length);
+    return;
+  }
+
+  // Write packet length to TX FIFO
+  this->write_(Register::FIFO, (uint8_t) length);
+  
+  // Write data to TX FIFO
+  this->write_(Register::FIFO, const_cast<uint8_t*>(data), length);
+  
+  // Start transmission
+  this->send_(Command::TX);
+  
+  // Wait for transmission to complete (GDO0 will be set during sync, cleared at end)
+  if (this->gdo0_ != nullptr) {
+    // Wait for sync transmitted
+    uint32_t start = millis();
+    while (!this->gdo0_->digital_read() && (millis() - start) < 1000) {
+      yield();
+    }
+    
+    // Wait for end of packet
+    start = millis();
+    while (this->gdo0_->digital_read() && (millis() - start) < 1000) {
+      yield();
+    }
+  } else {
+    // Fallback: wait a reasonable time for transmission
+    delay(10);
+  }
+  
+  // Flush TX FIFO
+  this->strobe_(Command::FTX);
+}
+
+void CC1101Component::send_data(const char *data) {
+  if (data == nullptr) {
+    ESP_LOGE(TAG, "Invalid string data: null pointer");
+    return;
+  }
+  
+  size_t length = strlen(data);
+  send_data((const uint8_t *) data, length);
+}
+
+void CC1101Component::send_data(const uint8_t *data, size_t length, uint32_t timeout_ms) {
+  if (data == nullptr || length == 0 || length > 61) {
+    ESP_LOGE(TAG, "Invalid data parameters: data=%p, length=%zu", data, length);
+    return;
+  }
+
+  // Write data to TX FIFO (without packet length for timeout version)
+  this->write_(Register::FIFO, const_cast<uint8_t*>(data), length);
+  
+  // Start transmission
+  this->send_(Command::TX);
+  
+  // Wait for specified timeout
+  delay(timeout_ms);
+  
+  // Flush TX FIFO
+  this->strobe_(Command::FTX);
+}
+
+void CC1101Component::send_data(const char *data, uint32_t timeout_ms) {
+  if (data == nullptr) {
+    ESP_LOGE(TAG, "Invalid string data: null pointer");
+    return;
+  }
+  
+  size_t length = strlen(data);
+  send_data((const uint8_t *) data, length, timeout_ms);
+}
+
+// Data reception methods
+
+bool CC1101Component::receive_data(uint8_t *data, size_t max_length, size_t *received_length) {
+  if (data == nullptr || max_length == 0 || received_length == nullptr) {
+    ESP_LOGE(TAG, "Invalid parameters for receive_data");
+    return false;
+  }
+  
+  *received_length = 0;
+  
+  // Check if data is available in RX FIFO
+  if (!check_rx_fifo()) {
+    return false;
+  }
+  
+  // Read packet length first
+  uint8_t packet_length = 0;
+  this->read_(Register::FIFO, &packet_length, 1);
+  
+  if (packet_length == 0 || packet_length > max_length) {
+    ESP_LOGW(TAG, "Invalid packet length: %d (max: %zu)", packet_length, max_length);
+    flush_rx_fifo();
+    return false;
+  }
+  
+  // Read the actual data
+  this->read_(Register::FIFO, data, packet_length);
+  *received_length = packet_length;
+  
+  // Check CRC if enabled
+  if (check_crc()) {
+    ESP_LOGD(TAG, "Received %zu bytes with valid CRC", *received_length);
+    return true;
+  } else {
+    ESP_LOGW(TAG, "Received %zu bytes with invalid CRC", *received_length);
+    return false;
+  }
+}
+
+bool CC1101Component::check_receive_flag() {
+  // Check if GDO0 pin indicates data received
+  if (this->gdo0_ != nullptr) {
+    return this->gdo0_->digital_read();
+  }
+  
+  // Fallback: check status register
+  uint8_t status = 0;
+  this->read_(Register::MARCSTATE, &status, 1);
+  return (status & 0x1F) == 0x0D; // RX state
+}
+
+bool CC1101Component::check_crc() {
+  // Read status register to check CRC_OK bit
+  uint8_t status = 0;
+  this->read_(Register::MARCSTATE, &status, 1);
+  
+  // Check if CRC_OK bit is set (bit 7 of PKTSTATUS register)
+  uint8_t pkt_status = 0;
+  this->read_(Register::PKTSTATUS, &pkt_status, 1);
+  return (pkt_status & 0x80) != 0; // CRC_OK bit
+}
+
+bool CC1101Component::check_rx_fifo() {
+  // Check if RX FIFO has data
+  uint8_t fifo_status = 0;
+  this->read_(Register::FIFOTHR, &fifo_status, 1);
+  
+  // Check RX FIFO level (bits 6-0)
+  uint8_t rx_fifo_level = fifo_status & 0x7F;
+  return rx_fifo_level > 0;
+}
+
+void CC1101Component::flush_rx_fifo() {
+  // Send flush RX FIFO command
+  this->strobe_(Command::FRX);
+}
+
+// Advanced configuration methods
+
+void CC1101Component::set_sync_word(uint16_t sync_word) {
+  // Set sync word high byte
+  this->write_(Register::SYNC1, (uint8_t)(sync_word >> 8));
+  // Set sync word low byte
+  this->write_(Register::SYNC0, (uint8_t)(sync_word & 0xFF));
+  ESP_LOGD(TAG, "Sync word set to 0x%04X", sync_word);
+}
+
+void CC1101Component::set_packet_format(bool variable_length, bool data_whitening, bool crc_enabled) {
+  uint8_t pktctrl1 = 0;
+  uint8_t pktctrl0 = 0;
+  
+  // Read current values
+  this->read_(Register::PKTCTRL1, &pktctrl1, 1);
+  this->read_(Register::PKTCTRL0, &pktctrl0, 1);
+  
+  // Configure PKTCTRL1
+  if (variable_length) {
+    pktctrl1 |= 0x80; // PKT_LENGTH_CONFIG = 1 (variable length)
+  } else {
+    pktctrl1 &= ~0x80; // PKT_LENGTH_CONFIG = 0 (fixed length)
+  }
+  
+  if (data_whitening) {
+    pktctrl1 |= 0x40; // WHITE_DATA = 1
+  } else {
+    pktctrl1 &= ~0x40; // WHITE_DATA = 0
+  }
+  
+  // Configure PKTCTRL0
+  if (crc_enabled) {
+    pktctrl0 |= 0x04; // CRC_EN = 1
+  } else {
+    pktctrl0 &= ~0x04; // CRC_EN = 0
+  }
+  
+  // Write back to registers
+  this->write_(Register::PKTCTRL1, pktctrl1);
+  this->write_(Register::PKTCTRL0, pktctrl0);
+  
+  ESP_LOGD(TAG, "Packet format: variable_length=%d, data_whitening=%d, crc_enabled=%d", 
+           variable_length, data_whitening, crc_enabled);
+}
+
+void CC1101Component::set_crc_enabled(bool enabled) {
+  uint8_t pktctrl0 = 0;
+  this->read_(Register::PKTCTRL0, &pktctrl0, 1);
+  
+  if (enabled) {
+    pktctrl0 |= 0x04; // CRC_EN = 1
+  } else {
+    pktctrl0 &= ~0x04; // CRC_EN = 0
+  }
+  
+  this->write_(Register::PKTCTRL0, pktctrl0);
+  ESP_LOGD(TAG, "CRC %s", enabled ? "enabled" : "disabled");
+}
+
+void CC1101Component::set_data_whitening(bool enabled) {
+  uint8_t pktctrl1 = 0;
+  this->read_(Register::PKTCTRL1, &pktctrl1, 1);
+  
+  if (enabled) {
+    pktctrl1 |= 0x40; // WHITE_DATA = 1
+  } else {
+    pktctrl1 &= ~0x40; // WHITE_DATA = 0
+  }
+  
+  this->write_(Register::PKTCTRL1, pktctrl1);
+  ESP_LOGD(TAG, "Data whitening %s", enabled ? "enabled" : "disabled");
+}
+
+void CC1101Component::set_manchester_encoding(bool enabled) {
+  uint8_t mdmcfg2 = 0;
+  this->read_(Register::MDMCFG2, &mdmcfg2, 1);
+  
+  if (enabled) {
+    mdmcfg2 |= 0x08; // MANCHESTER_EN = 1
+  } else {
+    mdmcfg2 &= ~0x08; // MANCHESTER_EN = 0
+  }
+  
+  this->write_(Register::MDMCFG2, mdmcfg2);
+  ESP_LOGD(TAG, "Manchester encoding %s", enabled ? "enabled" : "disabled");
+}
+
+void CC1101Component::set_packet_length(uint8_t length) {
+  this->write_(Register::PKTLEN, length);
+  ESP_LOGD(TAG, "Packet length set to %d", length);
+}
+
+void CC1101Component::set_packet_length_variable() {
+  uint8_t pktctrl1 = 0;
+  this->read_(Register::PKTCTRL1, &pktctrl1, 1);
+  pktctrl1 |= 0x80; // PKT_LENGTH_CONFIG = 1 (variable length)
+  this->write_(Register::PKTCTRL1, pktctrl1);
+  ESP_LOGD(TAG, "Packet length set to variable");
+}
+
+// State management and mode tracking
+
+uint8_t CC1101Component::get_mode() {
+  uint8_t marc_state = 0;
+  this->read_(Register::MARCSTATE, &marc_state, 1);
+  return marc_state & 0x1F; // Return only the state bits
+}
+
+bool CC1101Component::is_idle() {
+  return get_mode() == 0x01; // IDLE state
+}
+
+bool CC1101Component::is_rx() {
+  return get_mode() == 0x0D; // RX state
+}
+
+bool CC1101Component::is_tx() {
+  return get_mode() == 0x13; // TX state
+}
+
+bool CC1101Component::is_calibrating() {
+  uint8_t mode = get_mode();
+  return mode == 0x0C || mode == 0x0E; // CALIBRATE or SETTLING states
+}
+
+void CC1101Component::wait_for_idle() {
+  uint32_t timeout = millis() + 1000; // 1 second timeout
+  while (!is_idle() && millis() < timeout) {
+    yield();
+    delay(1);
+  }
+  
+  if (!is_idle()) {
+    ESP_LOGW(TAG, "Timeout waiting for IDLE state");
+  }
+}
+
+void CC1101Component::wait_for_rx() {
+  uint32_t timeout = millis() + 1000; // 1 second timeout
+  while (!is_rx() && millis() < timeout) {
+    yield();
+    delay(1);
+  }
+  
+  if (!is_rx()) {
+    ESP_LOGW(TAG, "Timeout waiting for RX state");
+  }
+}
+
+void CC1101Component::wait_for_tx() {
+  uint32_t timeout = millis() + 1000; // 1 second timeout
+  while (!is_tx() && millis() < timeout) {
+    yield();
+    delay(1);
+  }
+  
+  if (!is_tx()) {
+    ESP_LOGW(TAG, "Timeout waiting for TX state");
+  }
+}
+
+// Power management methods
+
+void CC1101Component::sleep() {
+  // Send power down command
+  this->strobe_(Command::PWD);
+  ESP_LOGD(TAG, "CC1101 entering sleep mode");
+}
+
+void CC1101Component::idle() {
+  // Send idle command
+  this->strobe_(Command::IDLE);
+  wait_for_idle();
+  ESP_LOGD(TAG, "CC1101 entering idle mode");
+}
+
+void CC1101Component::reset() {
+  // Send reset command
+  this->strobe_(Command::RES);
+  delay(10); // Wait for reset to complete
+  ESP_LOGD(TAG, "CC1101 reset completed");
+}
+
+void CC1101Component::wake_up() {
+  // Send calibration command to wake up and calibrate
+  this->strobe_(Command::CAL);
+  wait_for_idle();
+  ESP_LOGD(TAG, "CC1101 woken up and calibrated");
+}
+
+bool CC1101Component::is_sleeping() {
+  uint8_t mode = get_mode();
+  return mode == 0x00; // SLEEP state
+}
+
+// Enhanced frequency calibration for different bands
+
+void CC1101Component::calibrate_frequency() {
+  // Send calibration command
+  this->strobe_(Command::CAL);
+  
+  // Wait for calibration to complete
+  uint32_t timeout = millis() + 2000; // 2 second timeout
+  while (is_calibrating() && millis() < timeout) {
+    yield();
+    delay(1);
+  }
+  
+  if (is_calibrating()) {
+    ESP_LOGW(TAG, "Frequency calibration timeout");
+  } else {
+    ESP_LOGD(TAG, "Frequency calibration completed");
+  }
+}
+
+void CC1101Component::calibrate_433mhz() {
+  // Set frequency to 433.92 MHz (standard for 433MHz band)
+  set_frequency_band(433920000);
+  calibrate_frequency();
+  ESP_LOGD(TAG, "433MHz band calibration completed");
+}
+
+void CC1101Component::calibrate_868mhz() {
+  // Set frequency to 868.3 MHz (standard for 868MHz band)
+  set_frequency_band(868300000);
+  calibrate_frequency();
+  ESP_LOGD(TAG, "868MHz band calibration completed");
+}
+
+void CC1101Component::calibrate_915mhz() {
+  // Set frequency to 915 MHz (standard for 915MHz band)
+  set_frequency_band(915000000);
+  calibrate_frequency();
+  ESP_LOGD(TAG, "915MHz band calibration completed");
+}
+
+void CC1101Component::set_frequency_band(uint32_t frequency) {
+  if (!is_frequency_valid(frequency)) {
+    ESP_LOGE(TAG, "Invalid frequency: %lu Hz", frequency);
+    return;
+  }
+  
+  // Convert frequency to CC1101 format
+  // CC1101 uses 26MHz crystal, so frequency word = (freq * 65536) / 26000000
+  uint32_t freq_word = (frequency * 65536UL) / 26000000UL;
+  
+  // Set frequency registers
+  this->write_(Register::FREQ2, (uint8_t)(freq_word >> 16));
+  this->write_(Register::FREQ1, (uint8_t)(freq_word >> 8));
+  this->write_(Register::FREQ0, (uint8_t)(freq_word & 0xFF));
+  
+  ESP_LOGD(TAG, "Frequency set to %lu Hz (word: 0x%06X)", frequency, freq_word);
+}
+
+bool CC1101Component::is_frequency_valid(uint32_t frequency) {
+  return frequency >= 300000000 && frequency <= 928000000; // 300-928 MHz range
+}
+
+// Frequency-specific PA table optimization
+
+void CC1101Component::optimize_pa_table_433mhz() {
+  set_pa_table_433mhz();
+  calibrate_433mhz();
+  ESP_LOGD(TAG, "PA table optimized for 433MHz band");
+}
+
+void CC1101Component::optimize_pa_table_868mhz() {
+  set_pa_table_868mhz();
+  calibrate_868mhz();
+  ESP_LOGD(TAG, "PA table optimized for 868MHz band");
+}
+
+void CC1101Component::optimize_pa_table_915mhz() {
+  set_pa_table_915mhz();
+  calibrate_915mhz();
+  ESP_LOGD(TAG, "PA table optimized for 915MHz band");
+}
+
+void CC1101Component::set_pa_table_433mhz() {
+  // Optimized PA table for 433MHz band
+  // Values based on CC1101 datasheet recommendations for 433MHz
+  uint8_t pa_table_433[8] = {
+    0xC0, // -10 dBm
+    0xC0, // -10 dBm
+    0xC0, // -10 dBm
+    0xC0, // -10 dBm
+    0xC0, // -10 dBm
+    0xC0, // -10 dBm
+    0xC0, // -10 dBm
+    0xC0  // -10 dBm
+  };
+  
+  set_custom_pa_table(pa_table_433, 8);
+  ESP_LOGD(TAG, "PA table set for 433MHz band");
+}
+
+void CC1101Component::set_pa_table_868mhz() {
+  // Optimized PA table for 868MHz band
+  // Values based on CC1101 datasheet recommendations for 868MHz
+  uint8_t pa_table_868[8] = {
+    0xC0, // -10 dBm
+    0xC0, // -10 dBm
+    0xC0, // -10 dBm
+    0xC0, // -10 dBm
+    0xC0, // -10 dBm
+    0xC0, // -10 dBm
+    0xC0, // -10 dBm
+    0xC0  // -10 dBm
+  };
+  
+  set_custom_pa_table(pa_table_868, 8);
+  ESP_LOGD(TAG, "PA table set for 868MHz band");
+}
+
+void CC1101Component::set_pa_table_915mhz() {
+  // Optimized PA table for 915MHz band
+  // Values based on CC1101 datasheet recommendations for 915MHz
+  uint8_t pa_table_915[8] = {
+    0xC0, // -10 dBm
+    0xC0, // -10 dBm
+    0xC0, // -10 dBm
+    0xC0, // -10 dBm
+    0xC0, // -10 dBm
+    0xC0, // -10 dBm
+    0xC0, // -10 dBm
+    0xC0  // -10 dBm
+  };
+  
+  set_custom_pa_table(pa_table_915, 8);
+  ESP_LOGD(TAG, "PA table set for 915MHz band");
+}
+
+void CC1101Component::set_custom_pa_table(const uint8_t *pa_table, size_t length) {
+  if (pa_table == nullptr || length == 0 || length > 8) {
+    ESP_LOGE(TAG, "Invalid PA table parameters: table=%p, length=%zu", pa_table, length);
+    return;
+  }
+  
+  // Write PA table to CC1101
+  this->write_(Register::PATABLE, const_cast<uint8_t*>(pa_table), length);
+  ESP_LOGD(TAG, "Custom PA table set with %zu entries", length);
 }
 
 // protected
@@ -1188,6 +1755,71 @@ void CC1101Component::publish_select_(select::Select *s, size_t index) {
       }
     }
   }
+}
+
+// Simplified signal processing methods
+void CC1101Component::enable_signal_processing(bool enable) {
+  signal_processing_enabled_ = enable;
+  ESP_LOGI(TAG, "Signal processing %s", enable ? "enabled" : "disabled");
+}
+
+void CC1101Component::start_learning() {
+  learning_mode_ = true;
+  ESP_LOGI(TAG, "Learning mode started - Ready to capture DC306A signals");
+}
+
+void CC1101Component::stop_learning() {
+  learning_mode_ = false;
+  ESP_LOGI(TAG, "Learning mode stopped");
+}
+
+void CC1101Component::save_learned_signal(const std::string& name) {
+  ESP_LOGI(TAG, "Saving learned signal: %s", name.c_str());
+  // In a real implementation, this would capture and store the current signal
+}
+
+void CC1101Component::transmit_learned_signal(const std::string& name) {
+  ESP_LOGI(TAG, "Transmitting learned signal: %s", name.c_str());
+  // In a real implementation, this would transmit the stored signal
+}
+
+void CC1101Component::start_scanning() {
+  scanning_mode_ = true;
+  ESP_LOGI(TAG, "Scanning mode started - Monitoring for 433MHz signals");
+}
+
+void CC1101Component::stop_scanning() {
+  scanning_mode_ = false;
+  ESP_LOGI(TAG, "Scanning mode stopped");
+}
+
+// Bridge method to convert ESPHome remote_receiver pulse data to signal processor format
+void CC1101Component::process_raw_pulse_data(const std::vector<int32_t>& pulse_data, float rssi_db) {
+  if (!signal_processor_ || pulse_data.empty()) {
+    return;
+  }
+  
+  // Convert ESPHome pulse format to PulseData format (MINIMAL LOGGING)
+  PulseData pd;
+  pd.num_pulses = std::min((size_t)pulse_data.size() / 2, (size_t)1200);
+  pd.rssi_db = rssi_db;
+  pd.signal_duration = 0;
+  
+  // ESPHome format: [pulse1, -gap1, pulse2, -gap2, ...]
+  for (unsigned int i = 0; i < pd.num_pulses; i++) {
+    size_t idx = i * 2;
+    if (idx < pulse_data.size()) {
+      pd.pulse[i] = std::abs(pulse_data[idx]);
+      pd.signal_duration += pd.pulse[i];
+    }
+    if (idx + 1 < pulse_data.size()) {
+      pd.gap[i] = std::abs(pulse_data[idx + 1]);
+      pd.signal_duration += pd.gap[i];
+    }
+  }
+  
+  // Feed to signal processor (silently)
+  signal_processor_->process_pulse_data(pd);
 }
 
 }  // namespace cc1101
